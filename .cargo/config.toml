@@ -1,0 +1,11 @@
+# SG2002 target configuration. Host builds are unaffected.
+#
+# The AKA-00 board uses the xthead-named musl loader. The repo-managed Xuantie
+# V3.4.0 GCC toolchain provides the sysroot and linker for this target.
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "scripts/linker.sh"
+rustflags = [
+  "-C", "target-feature=-crt-static",
+  "-C", "link-arg=-Wl,--dynamic-linker=/lib/ld-musl-riscv64v0p7_xthead.so.1",
+]
