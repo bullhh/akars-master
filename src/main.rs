@@ -1,10 +1,12 @@
 use akars::arm::Arm;
+use akars::arm_config::{ArmCalibration, ArmPose, ArmPoseName};
 use akars::camera::UsbCamera;
 use akars::motor::{Motor, MotorConfig};
 use akars::robot::{install_signal_handlers, run_tennis_hunter, RobotConfig};
 use akars::tpu::{open_model, InferenceConfig};
 use akars::web::{serve, WebConfig};
 use std::env;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -14,6 +16,7 @@ struct Cli {
     camera: String,
     motor: String,
     arm: String,
+    arm_config: PathBuf,
     frames: Option<u64>,
     classes: i32,
     conf: f32,
@@ -46,10 +49,41 @@ struct CaptureCli {
 #[derive(Debug)]
 struct ArmTestCli {
     arm: String,
+    config: PathBuf,
+    save_pose: Option<ArmPoseName>,
     servo0: f32,
     servo1: f32,
     servo2: f32,
     time_ms: i32,
+}
+
+/// Arguments for replaying one persisted arm pose.
+#[derive(Debug)]
+struct ArmPoseCli {
+    arm: String,
+    config: PathBuf,
+    pose: ArmPoseName,
+    time_ms: i32,
+}
+
+/// Arguments for printing the persisted arm calibration.
+#[derive(Debug)]
+struct ArmShowCli {
+    config: PathBuf,
+}
+
+/// Arguments for persisting the visual stop-distance threshold.
+#[derive(Debug)]
+struct StopSetCli {
+    config: PathBuf,
+    stop_area: f32,
+}
+
+/// Arguments for persisting the horizontal grab-target offset.
+#[derive(Debug)]
+struct CenterSetCli {
+    config: PathBuf,
+    center_offset_px: i32,
 }
 
 #[derive(Debug)]
@@ -59,6 +93,10 @@ enum Command {
     Detect(DetectCli),
     Capture(CaptureCli),
     ArmTest(ArmTestCli),
+    ArmPose(ArmPoseCli),
+    ArmShow(ArmShowCli),
+    StopSet(StopSetCli),
+    CenterSet(CenterSetCli),
 }
 
 impl Default for Cli {
@@ -66,8 +104,9 @@ impl Default for Cli {
         Self {
             model: PathBuf::new(),
             camera: "/dev/cvi-usb-camera0".to_string(),
-            motor: "/dev/ttyS3".to_string(),
+            motor: "/dev/ttyS1".to_string(),
             arm: "/dev/ttyS2".to_string(),
+            arm_config: PathBuf::from("arm.conf"),
             frames: None,
             classes: 1,
             conf: 0.5,
@@ -103,6 +142,8 @@ impl Default for ArmTestCli {
     fn default() -> Self {
         Self {
             arm: "/dev/ttyS2".to_string(),
+            config: PathBuf::from("arm.conf"),
+            save_pose: None,
             servo0: 0.0,
             servo1: 0.0,
             servo2: 0.0,
@@ -139,10 +180,21 @@ fn main() {
         Command::Detect(cli) => run_detect(cli),
         Command::Capture(cli) => run_capture(cli),
         Command::ArmTest(cli) => run_armtest(cli),
+        Command::ArmPose(cli) => run_armpose(cli),
+        Command::ArmShow(cli) => run_armshow(cli),
+        Command::StopSet(cli) => run_stopset(cli),
+        Command::CenterSet(cli) => run_centerset(cli),
     }
 }
 
 fn run_armtest(cli: ArmTestCli) {
+    let pose = match ArmPose::new(cli.servo0, cli.servo1, cli.servo2) {
+        Ok(pose) => pose,
+        Err(err) => {
+            eprintln!("[armtest] invalid pose: {err}");
+            std::process::exit(1);
+        }
+    };
     let mut arm = match Arm::open(&cli.arm, 115200) {
         Ok(arm) => arm,
         Err(err) => {
@@ -152,14 +204,102 @@ fn run_armtest(cli: ArmTestCli) {
     };
 
     let time_ms = cli.time_ms.clamp(0, 10_000);
-    arm.set_angle(0, cli.servo0, time_ms);
-    arm.set_angle(1, cli.servo1, time_ms);
-    arm.set_angle(2, cli.servo2, time_ms);
+    arm.move_to_pose(pose, time_ms);
 
     eprintln!(
         "[armtest] sent: servo0={:.1} servo1={:.1} servo2={:.1} time_ms={}",
         cli.servo0, cli.servo1, cli.servo2, time_ms
     );
+
+    if let Some(name) = cli.save_pose {
+        let mut calibration = load_arm_calibration(&cli.config);
+        calibration.set(name, pose);
+        if let Err(err) = calibration.save(&cli.config) {
+            eprintln!("[armcal] failed to save {}: {err}", cli.config.display());
+            std::process::exit(1);
+        }
+        eprintln!("[armcal] saved {name}={pose} to {}", cli.config.display());
+    }
+}
+
+fn run_armpose(cli: ArmPoseCli) {
+    let calibration = load_arm_calibration(&cli.config);
+    let pose = calibration.pose(cli.pose);
+    let mut arm = match Arm::open(&cli.arm, 115200) {
+        Ok(arm) => arm,
+        Err(err) => {
+            eprintln!("[armpose] failed to open {}: {err}", cli.arm);
+            std::process::exit(1);
+        }
+    };
+    let time_ms = cli.time_ms.clamp(0, 10_000);
+    arm.move_to_pose(pose, time_ms);
+    eprintln!(
+        "[armpose] applied {}={} from {} in {} ms",
+        cli.pose,
+        pose,
+        cli.config.display(),
+        time_ms
+    );
+}
+
+fn run_armshow(cli: ArmShowCli) {
+    let calibration = load_arm_calibration(&cli.config);
+    print!("{calibration}");
+}
+
+fn run_stopset(cli: StopSetCli) {
+    let mut calibration = load_arm_calibration(&cli.config);
+    if let Err(err) = calibration.set_stop_area(cli.stop_area) {
+        eprintln!("[stopset] invalid stop_area: {err}");
+        std::process::exit(1);
+    }
+    if let Err(err) = calibration.save(&cli.config) {
+        eprintln!("[stopset] failed to save {}: {err}", cli.config.display());
+        std::process::exit(1);
+    }
+    eprintln!(
+        "[stopset] saved stop_area={:.3} to {} (larger means closer)",
+        calibration.stop_area,
+        cli.config.display()
+    );
+}
+
+fn run_centerset(cli: CenterSetCli) {
+    let mut calibration = load_arm_calibration(&cli.config);
+    if let Err(err) = calibration.set_center_offset_px(cli.center_offset_px) {
+        eprintln!("[centerset] invalid center_offset_px: {err}");
+        std::process::exit(1);
+    }
+    if let Err(err) = calibration.save(&cli.config) {
+        eprintln!("[centerset] failed to save {}: {err}", cli.config.display());
+        std::process::exit(1);
+    }
+    eprintln!(
+        "[centerset] saved center_offset_px={} to {} (positive means image right)",
+        calibration.center_offset_px,
+        cli.config.display()
+    );
+}
+
+fn load_arm_calibration(path: &std::path::Path) -> ArmCalibration {
+    match ArmCalibration::load(path) {
+        Ok(calibration) => {
+            eprintln!("[armcal] loaded {}", path.display());
+            calibration
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "[armcal] {} not found; using built-in defaults",
+                path.display()
+            );
+            ArmCalibration::default()
+        }
+        Err(err) => {
+            eprintln!("[armcal] failed to load {}: {err}", path.display());
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_hunt(cli: Cli) {
@@ -200,7 +340,8 @@ fn run_hunt(cli: Cli) {
     };
     eprintln!("[dbg] motor opened, opening arm {} ...", cli.arm);
 
-    let arm = match Arm::open(&cli.arm, 115200) {
+    let arm_calibration = load_arm_calibration(&cli.arm_config);
+    let arm = match Arm::open_with_calibration(&cli.arm, 115200, arm_calibration) {
         Ok(arm) => arm,
         Err(err) => {
             eprintln!("[arm] failed to open {}: {err}", cli.arm);
@@ -216,6 +357,8 @@ fn run_hunt(cli: Cli) {
             iou_threshold: cli.iou,
         },
         max_frames: cli.frames,
+        stop_area: arm_calibration.stop_area,
+        center_offset_px: arm_calibration.center_offset_px,
     };
 
     run_tennis_hunter(camera, model, motor, arm, config);
@@ -342,6 +485,22 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Command, String> {
             args.next();
             parse_armtest_cli(args).map(Command::ArmTest)
         }
+        Some("armpose") => {
+            args.next();
+            parse_armpose_cli(args).map(Command::ArmPose)
+        }
+        Some("armshow") => {
+            args.next();
+            parse_armshow_cli(args).map(Command::ArmShow)
+        }
+        Some("stopset") => {
+            args.next();
+            parse_stopset_cli(args).map(Command::StopSet)
+        }
+        Some("centerset") => {
+            args.next();
+            parse_centerset_cli(args).map(Command::CenterSet)
+        }
         _ => parse_hunt_cli(args).map(Command::Hunt),
     }
 }
@@ -358,6 +517,10 @@ fn parse_armtest_cli(args: impl Iterator<Item = String>) -> Result<ArmTestCli, S
                 std::process::exit(0);
             }
             "--arm" => cli.arm = take_value(&mut args, "--arm")?,
+            "--config" => cli.config = PathBuf::from(take_value(&mut args, "--config")?),
+            "--save" => {
+                cli.save_pose = Some(take_value(&mut args, "--save")?.parse::<ArmPoseName>()?);
+            }
             "--time" => {
                 cli.time_ms = take_value(&mut args, "--time")?
                     .parse()
@@ -390,6 +553,114 @@ fn parse_armtest_cli(args: impl Iterator<Item = String>) -> Result<ArmTestCli, S
     Ok(cli)
 }
 
+fn parse_armpose_cli(args: impl Iterator<Item = String>) -> Result<ArmPoseCli, String> {
+    let mut arm = "/dev/ttyS2".to_string();
+    let mut config = PathBuf::from("arm.conf");
+    let mut pose = None;
+    let mut time_ms = 1000;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_armpose_usage();
+                std::process::exit(0);
+            }
+            "--arm" => arm = take_value(&mut args, "--arm")?,
+            "--config" => config = PathBuf::from(take_value(&mut args, "--config")?),
+            "--time" => {
+                time_ms = take_value(&mut args, "--time")?
+                    .parse()
+                    .map_err(|_| "--time expects an integer (ms)".to_string())?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown armpose option: {value}"));
+            }
+            value if pose.is_none() => pose = Some(value.parse::<ArmPoseName>()?),
+            value => return Err(format!("unexpected armpose argument: {value}")),
+        }
+    }
+    Ok(ArmPoseCli {
+        arm,
+        config,
+        pose: pose.ok_or_else(|| "armpose requires a pose name".to_string())?,
+        time_ms,
+    })
+}
+
+fn parse_armshow_cli(args: impl Iterator<Item = String>) -> Result<ArmShowCli, String> {
+    let mut config = PathBuf::from("arm.conf");
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_armshow_usage();
+                std::process::exit(0);
+            }
+            "--config" => config = PathBuf::from(take_value(&mut args, "--config")?),
+            value => return Err(format!("unexpected armshow argument: {value}")),
+        }
+    }
+    Ok(ArmShowCli { config })
+}
+
+fn parse_stopset_cli(args: impl Iterator<Item = String>) -> Result<StopSetCli, String> {
+    let mut config = PathBuf::from("arm.conf");
+    let mut stop_area = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_stopset_usage();
+                std::process::exit(0);
+            }
+            "--config" => config = PathBuf::from(take_value(&mut args, "--config")?),
+            value if value.starts_with('-') => {
+                return Err(format!("unknown stopset option: {value}"));
+            }
+            value if stop_area.is_none() => {
+                stop_area = Some(
+                    value
+                        .parse::<f32>()
+                        .map_err(|_| format!("invalid stop_area value: {value}"))?,
+                );
+            }
+            value => return Err(format!("unexpected stopset argument: {value}")),
+        }
+    }
+    Ok(StopSetCli {
+        config,
+        stop_area: stop_area.ok_or_else(|| "stopset requires a stop_area value".to_string())?,
+    })
+}
+
+fn parse_centerset_cli(args: impl Iterator<Item = String>) -> Result<CenterSetCli, String> {
+    let mut config = PathBuf::from("arm.conf");
+    let mut center_offset_px = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_centerset_usage();
+                std::process::exit(0);
+            }
+            "--config" => config = PathBuf::from(take_value(&mut args, "--config")?),
+            value if center_offset_px.is_none() => {
+                center_offset_px = Some(
+                    value
+                        .parse::<i32>()
+                        .map_err(|_| format!("invalid center_offset_px value: {value}"))?,
+                );
+            }
+            value => return Err(format!("unexpected centerset argument: {value}")),
+        }
+    }
+    Ok(CenterSetCli {
+        config,
+        center_offset_px: center_offset_px
+            .ok_or_else(|| "centerset requires a center_offset_px value".to_string())?,
+    })
+}
+
 fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut cli = Cli::default();
     let mut args = args.peekable();
@@ -402,6 +673,9 @@ fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--camera" => cli.camera = take_value(&mut args, "--camera")?,
             "--motor" => cli.motor = take_value(&mut args, "--motor")?,
             "--arm" => cli.arm = take_value(&mut args, "--arm")?,
+            "--arm-config" => {
+                cli.arm_config = PathBuf::from(take_value(&mut args, "--arm-config")?)
+            }
             "--frames" => {
                 cli.frames = Some(
                     take_value(&mut args, "--frames")?
@@ -459,6 +733,9 @@ fn parse_serve_cli(args: impl Iterator<Item = String>) -> Result<WebConfig, Stri
             }
             "--motor" => config.motor_device = take_value(&mut args, "--motor")?,
             "--arm" => config.arm_device = take_value(&mut args, "--arm")?,
+            "--arm-config" => {
+                config.arm_config = PathBuf::from(take_value(&mut args, "--arm-config")?)
+            }
             "--mock" => config.mock = true,
             value if value.starts_with('-') => {
                 return Err(format!("unknown serve option: {value}"))
@@ -560,7 +837,7 @@ fn take_value(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]"
+        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--arm-config PATH] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--arm-config PATH] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS] [--save POSE] [--config PATH]\n  akars armpose <ready|approach|closed|lift> [--arm DEV] [--time MS] [--config PATH]\n  akars armshow [--config PATH]\n  akars stopset <0.05..0.90> [--config PATH]\n  akars centerset <-240..240> [--config PATH]"
     );
 }
 
@@ -578,12 +855,51 @@ fn print_detect_usage() {
 
 fn print_web_usage() {
     eprintln!(
-        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS3\n  --arm /dev/ttyS2"
+        "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--arm-config PATH] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS1\n  --arm /dev/ttyS2\n  --arm-config arm.conf"
     );
 }
 
 fn print_armtest_usage() {
     eprintln!(
-        "Usage: akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]\n\nSets three arm servo angles directly for debugging.\n\nDefaults:\n  --arm /dev/ttyS2\n  --time 1000"
+        "Usage: akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS] [--save POSE] [--config PATH]\n\nMoves all three servos to explicit angles. After physically verifying a pose, rerun with --save ready|approach|closed|lift to persist it.\n\nDefaults:\n  --arm /dev/ttyS2\n  --time 1000\n  --config arm.conf"
     );
+}
+
+fn print_armpose_usage() {
+    eprintln!(
+        "Usage: akars armpose <ready|approach|closed|lift> [--arm DEV] [--time MS] [--config PATH]\n\nLoads one saved pose and applies it to the arm."
+    );
+}
+
+fn print_armshow_usage() {
+    eprintln!("Usage: akars armshow [--config PATH]\n\nPrints the effective arm calibration.");
+}
+
+fn print_stopset_usage() {
+    eprintln!(
+        "Usage: akars stopset <0.05..0.90> [--config PATH]\n\nPersists the visual stop distance. A larger value stops closer to the ball. The tuned default is 0.50."
+    );
+}
+
+fn print_centerset_usage() {
+    eprintln!(
+        "Usage: akars centerset <-240..240> [--config PATH]\n\nPersists the horizontal grab target in reference-frame pixels. Positive values place the ball to the image right."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, WebConfig};
+
+    #[test]
+    fn uses_board_device_defaults() {
+        let hunt = Cli::default();
+        assert_eq!(hunt.camera, "/dev/cvi-usb-camera0");
+        assert_eq!(hunt.motor, "/dev/ttyS1");
+        assert_eq!(hunt.arm, "/dev/ttyS2");
+
+        let web = WebConfig::default();
+        assert_eq!(web.motor_device, "/dev/ttyS1");
+        assert_eq!(web.arm_device, "/dev/ttyS2");
+    }
 }

@@ -1,4 +1,5 @@
 use crate::arm::Arm;
+use crate::arm_config::ArmCalibration;
 use crate::motor::{Motor, MotorConfig};
 use axum::extract::{Query, State};
 use axum::response::Html;
@@ -7,6 +8,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -14,6 +16,7 @@ pub struct WebConfig {
     pub listen: SocketAddr,
     pub motor_device: String,
     pub arm_device: String,
+    pub arm_config: PathBuf,
     pub mock: bool,
 }
 
@@ -21,8 +24,9 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
-            motor_device: "/dev/ttyS3".to_string(),
+            motor_device: "/dev/ttyS1".to_string(),
             arm_device: "/dev/ttyS2".to_string(),
+            arm_config: PathBuf::from("arm.conf"),
             mock: false,
         }
     }
@@ -231,7 +235,28 @@ impl HardwareState {
             Err(err) => self.motor_error = Some(format!("{}: {err}", config.motor_device)),
         }
 
-        match Arm::open(&config.arm_device, 115200) {
+        let calibration = match ArmCalibration::load(&config.arm_config) {
+            Ok(calibration) => {
+                eprintln!("[armcal] loaded {}", config.arm_config.display());
+                calibration
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                eprintln!(
+                    "[armcal] {} not found; using built-in defaults",
+                    config.arm_config.display()
+                );
+                ArmCalibration::default()
+            }
+            Err(err) => {
+                self.arm_error = Some(format!(
+                    "failed to load {}: {err}",
+                    config.arm_config.display()
+                ));
+                self.last_action = "connect".to_string();
+                return;
+            }
+        };
+        match Arm::open_with_calibration(&config.arm_device, 115200, calibration) {
             Ok(arm) => self.arm = Some(arm),
             Err(err) => self.arm_error = Some(format!("{}: {err}", config.arm_device)),
         }
