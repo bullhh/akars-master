@@ -410,6 +410,16 @@ fn handle_detections(
         robot.last_motion_was_forward = false;
         robot.miss_count += 1;
 
+        if allow_one_frame_far_miss(robot) {
+            // 远距离的小球容易偶发漏检一帧。Fast/Medium 阶段只宽限第一帧，
+            // 不下发新的电机命令，让上一条连续驱动命令保持；第二帧起立即停车。
+            eprintln!(
+                "[detect] missed 1 frame during {:?}, keeping last motion",
+                robot.approach_phase
+            );
+            return;
+        }
+
         if robot.miss_count <= LOST_GRACE_FRAMES {
             // 宽限期内:刚才还看得到球,先停住等它重现,别急着盲搜。
             eprintln!(
@@ -645,6 +655,15 @@ fn handle_detections(
     }
 }
 
+fn allow_one_frame_far_miss(robot: &RobotState) -> bool {
+    robot.miss_count == 1
+        && !robot.positioning
+        && matches!(
+            robot.approach_phase,
+            ApproachPhase::Fast | ApproachPhase::Medium
+        )
+}
+
 fn drive_continuous_approach(
     label: &str,
     offset: i32,
@@ -801,9 +820,10 @@ fn sleep_us(us: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        approach_center_offset, approach_thresholds, forward_steering_speeds, position_turn_us,
-        proportional_turn_delta, scaled_reference_px, target_phase_for_area, target_x,
-        ApproachPhase, RobotState, SteeringState, POSITION_TURN_MAX_US, POSITION_TURN_MIN_US,
+        allow_one_frame_far_miss, approach_center_offset, approach_thresholds,
+        forward_steering_speeds, position_turn_us, proportional_turn_delta, scaled_reference_px,
+        target_phase_for_area, target_x, ApproachPhase, RobotState, SteeringState,
+        POSITION_TURN_MAX_US, POSITION_TURN_MIN_US,
     };
 
     #[test]
@@ -836,6 +856,27 @@ mod tests {
         let (fast, medium) = approach_thresholds(0.48);
         assert!((fast - 0.336).abs() < 0.0001);
         assert!((medium - 0.432).abs() < 0.0001);
+    }
+
+    #[test]
+    fn allows_only_the_first_far_detection_miss() {
+        let mut state = RobotState::default();
+        state.miss_count = 1;
+        assert!(allow_one_frame_far_miss(&state));
+
+        state.miss_count = 2;
+        assert!(!allow_one_frame_far_miss(&state));
+
+        state.miss_count = 1;
+        state.approach_phase = ApproachPhase::Medium;
+        assert!(allow_one_frame_far_miss(&state));
+
+        state.approach_phase = ApproachPhase::Fine;
+        assert!(!allow_one_frame_far_miss(&state));
+
+        state.approach_phase = ApproachPhase::Fast;
+        state.positioning = true;
+        assert!(!allow_one_frame_far_miss(&state));
     }
 
     #[test]
