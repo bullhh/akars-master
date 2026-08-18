@@ -50,10 +50,18 @@ enum SteeringState {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DistanceRecovery {
+    None,
+    Confirming(i32),
+    Recovered(ApproachPhase),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RobotState {
     status: RobotStatus,
     area_ratio: f32,
+    filtered_area_ratio: f32,
     ball_cx: i32,
     grab_confirm_count: i32,
     // 连续漏检帧数;在宽限期内先保持不动等球重现,超过阈值才判定真丢并搜索。
@@ -67,6 +75,9 @@ struct RobotState {
     ineffective_alignment_count: i32,
     approach_phase: ApproachPhase,
     positioning: bool,
+    far_recovery_count: i32,
+    fast_recovery_count: i32,
+    near_lock_frames: i32,
     filtered_ball_cx: Option<f32>,
     steering: SteeringState,
 }
@@ -76,6 +87,7 @@ impl Default for RobotState {
         Self {
             status: RobotStatus::ChaseTennis,
             area_ratio: 0.0,
+            filtered_area_ratio: 0.0,
             ball_cx: 0,
             grab_confirm_count: 0,
             miss_count: 0,
@@ -88,6 +100,9 @@ impl Default for RobotState {
             ineffective_alignment_count: 0,
             approach_phase: ApproachPhase::Fast,
             positioning: false,
+            far_recovery_count: 0,
+            fast_recovery_count: 0,
+            near_lock_frames: 0,
             filtered_ball_cx: None,
             steering: SteeringState::Straight,
         }
@@ -173,6 +188,9 @@ impl RobotState {
     fn reset_approach(&mut self) {
         self.approach_phase = ApproachPhase::Fast;
         self.positioning = false;
+        self.far_recovery_count = 0;
+        self.fast_recovery_count = 0;
+        self.near_lock_frames = 0;
         self.filtered_ball_cx = None;
         self.steering = SteeringState::Straight;
         self.pending_alignment_error = None;
@@ -187,15 +205,74 @@ impl RobotState {
             self.ineffective_alignment_count = 0;
         }
     }
+
+    fn observe_distance_recovery(
+        &mut self,
+        filtered_area: f32,
+        fast_exit: f32,
+        medium_exit: f32,
+        ball_safely_visible: bool,
+    ) -> DistanceRecovery {
+        if filtered_area >= medium_exit {
+            self.near_lock_frames = NEAR_LOCK_VALID_FRAMES;
+        } else if self.near_lock_frames > 0 {
+            self.near_lock_frames -= 1;
+        }
+
+        if self.positioning || self.approach_phase == ApproachPhase::Fine {
+            self.fast_recovery_count = 0;
+
+            if filtered_area >= fast_exit || !ball_safely_visible {
+                self.far_recovery_count = 0;
+                return DistanceRecovery::None;
+            }
+
+            self.far_recovery_count += 1;
+            if self.far_recovery_count < FAR_RECOVERY_CONFIRM_FRAMES {
+                return DistanceRecovery::Confirming(self.far_recovery_count);
+            }
+
+            self.positioning = false;
+            self.grab_confirm_count = 0;
+            self.far_recovery_count = 0;
+            self.enter_approach_phase(ApproachPhase::Medium);
+            return DistanceRecovery::Recovered(ApproachPhase::Medium);
+        }
+
+        self.far_recovery_count = 0;
+        let fast_recovery_threshold = (fast_exit - FAST_RECOVERY_MARGIN).max(0.0);
+        if self.approach_phase == ApproachPhase::Medium
+            && self.near_lock_frames == 0
+            && filtered_area < fast_recovery_threshold
+            && ball_safely_visible
+        {
+            self.fast_recovery_count += 1;
+            if self.fast_recovery_count >= FAST_RECOVERY_CONFIRM_FRAMES {
+                self.fast_recovery_count = 0;
+                self.enter_approach_phase(ApproachPhase::Fast);
+                return DistanceRecovery::Recovered(ApproachPhase::Fast);
+            }
+        } else {
+            self.fast_recovery_count = 0;
+        }
+
+        DistanceRecovery::None
+    }
 }
 
 // 参考帧宽度。像素类阈值(如中心死区)以此为基准按分辨率缩放,保证不同分辨率下行为一致。
 const REFERENCE_FRAME_WIDTH: f32 = 640.0;
 const DISTANCE_MARGIN: f32 = 0.02;
-// 速度分段按停车面积的比例计算，避免 stop_area 从 0.75 调到 0.50 后过早降速。
-// stop_area=0.50 时，distance_low=0.48，高速/中速出口约为 0.34/0.43。
-const FAST_EXIT_RATIO: f32 = 0.70;
-const MEDIUM_EXIT_RATIO: f32 = 0.90;
+// 速度分段按停车面积的比例计算。实车日志显示制动后面积仍会继续增长约三个识别周期，
+// 因此将 Fast/Medium 出口各提前约一帧；stop_area=0.48 时约为 0.23/0.30。
+const FAST_EXIT_RATIO: f32 = 0.50;
+const MEDIUM_EXIT_RATIO: f32 = 0.65;
+// Fine/positioning 中先停车收集连续远距离证据，只恢复到 Medium；近期出现过近距离
+// 检测时锁住 Fast，待额外远距离帧确认后才分级提速，避免检测框缩小导致近处冲球。
+const FAR_RECOVERY_CONFIRM_FRAMES: i32 = 4;
+const FAST_RECOVERY_CONFIRM_FRAMES: i32 = 3;
+const FAST_RECOVERY_MARGIN: f32 = 0.02;
+const NEAR_LOCK_VALID_FRAMES: i32 = 8;
 // 进入最终定位后采用更宽的距离滞回；只有明显越界才重新前进或后退。
 const POSITION_DISTANCE_MARGIN: f32 = 0.05;
 const GRAB_CENTER_MARGIN_PX: i32 = 35;
@@ -208,15 +285,15 @@ const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 // 避免转向时的偶发漏检(运动模糊/擦边)立刻触发盲搜把球搞丢。
 const LOST_GRACE_FRAMES: i32 = 8;
 
-// 没检测到球时原地慢转搜索的速度。
-const IDLE_SPEED: i32 = 18;
+// 没检测到球时原地搜索。
+const IDLE_SPEED: i32 = 28;
 const FAR_DISTANCE_SPEED: i32 = 45;
 const MEDIUM_DISTANCE_SPEED: i32 = 32;
-const NEAR_DISTANCE_SPEED: i32 = 28;
+const NEAR_DISTANCE_SPEED: i32 = 25;
 const FAR_ARC_TURN_DELTA: i32 = 8;
 const MEDIUM_ARC_TURN_DELTA: i32 = 6;
 const NEAR_ARC_TURN_DELTA: i32 = 6;
-const NEAR_MOVE_US: u64 = 70_000;
+const NEAR_MOVE_US: u64 = 90_000;
 const POSITION_TURN_SPEED: i32 = 30;
 const POSITION_TURN_MIN_US: u64 = 60_000;
 const POSITION_TURN_MAX_US: u64 = 100_000;
@@ -280,6 +357,7 @@ pub fn run_tennis_hunter(
             Ok(frame) => frame,
             Err(err) => {
                 eprintln!("[camera] failed to get frame: {err}");
+                motor.brake();
                 sleep_us(100_000);
                 continue;
             }
@@ -306,6 +384,7 @@ pub fn run_tennis_hunter(
         };
         if let Err(err) = preprocess_result {
             eprintln!("[pre] YUV preprocess failed: {err}");
+            motor.brake();
             continue;
         }
         let preprocess_us = preprocess_start.elapsed().as_micros() as i64;
@@ -335,6 +414,7 @@ pub fn run_tennis_hunter(
             Ok(detections) => detections,
             Err(err) => {
                 eprintln!("[detect] inference failed: {err}");
+                motor.brake();
                 continue;
             }
         };
@@ -408,9 +488,11 @@ fn handle_detections(
         robot.area_sample_next = 0;
         robot.previous_raw_area = None;
         robot.last_motion_was_forward = false;
+        robot.far_recovery_count = 0;
+        robot.fast_recovery_count = 0;
         robot.miss_count += 1;
 
-        if allow_one_frame_far_miss(robot) {
+        if allow_one_frame_far_miss(robot, stop_area) {
             // 远距离的小球容易偶发漏检一帧。Fast/Medium 阶段只宽限第一帧，
             // 不下发新的电机命令，让上一条连续驱动命令保持；第二帧起立即停车。
             eprintln!(
@@ -457,12 +539,42 @@ fn handle_detections(
     let area_ratio = (best.bbox.w * best.bbox.h) / image_area;
     let filtered_area = robot.filtered_area(area_ratio);
     let predicted_area = robot.predicted_area(filtered_area);
+    // 加速和正常定位仍使用滤波面积；只有减速采用更保守的当前/预测较大值，
+    // 防止滤波滞后一帧时继续前进造成过冲。
+    let braking_area = area_ratio.max(predicted_area);
     let raw_ball_cx = best.bbox.x as i32;
     let ball_cx = robot.filtered_ball_x(raw_ball_cx);
+    let ball_safely_visible = raw_ball_cx >= image_w / 6 && raw_ball_cx <= image_w * 5 / 6;
     let distance_low = (stop_area - DISTANCE_MARGIN).max(0.0);
     let position_low = (stop_area - POSITION_DISTANCE_MARGIN).max(0.0);
     let position_high = (stop_area + POSITION_DISTANCE_MARGIN).min(1.0);
     let (fast_exit, medium_exit) = approach_thresholds(distance_low);
+    let previous_phase = robot.approach_phase;
+    let was_positioning = robot.positioning;
+    robot.area_ratio = area_ratio;
+    robot.filtered_area_ratio = filtered_area;
+    robot.ball_cx = ball_cx;
+    match robot.observe_distance_recovery(
+        filtered_area,
+        fast_exit,
+        medium_exit,
+        ball_safely_visible,
+    ) {
+        DistanceRecovery::None => {}
+        DistanceRecovery::Confirming(count) => {
+            eprintln!(
+                "[control] far-confirm: phase={previous_phase:?} positioning={was_positioning} count={count}/{FAR_RECOVERY_CONFIRM_FRAMES} filtered={filtered_area:.3} threshold={fast_exit:.3}; braking for stationary check"
+            );
+            motor.brake();
+            return;
+        }
+        DistanceRecovery::Recovered(recovered_phase) => {
+            eprintln!(
+                "[control] far-recovery: phase={previous_phase:?} positioning={was_positioning} -> {recovered_phase:?} filtered={filtered_area:.3} fast-threshold={fast_exit:.3} near-lock={} visible={ball_safely_visible}",
+                robot.near_lock_frames,
+            );
+        }
+    }
     let target_phase = if robot.positioning {
         ApproachPhase::Fine
     } else {
@@ -490,14 +602,12 @@ fn handle_detections(
         robot.observe_alignment_result(offset);
     }
 
-    robot.area_ratio = area_ratio;
-    robot.ball_cx = ball_cx;
-
     eprintln!(
-        "[detect] phase={:?} positioning={} area={area_ratio:.3} filtered={filtered_area:.3} predicted={predicted_area:.3} cx_raw={raw_ball_cx} cx={ball_cx} target={center} error={offset} margin={center_margin} conf={:.3} centered={centered}",
+        "[detect] phase={:?} positioning={} area={area_ratio:.3} filtered={filtered_area:.3} predicted={predicted_area:.3} cx_raw={raw_ball_cx} cx={ball_cx} target={center} error={offset} margin={center_margin} conf={:.3} centered={centered} near_lock={}",
         robot.approach_phase,
         robot.positioning,
         best.score,
+        robot.near_lock_frames,
     );
 
     if !robot.positioning && filtered_area >= distance_low {
@@ -514,14 +624,26 @@ fn handle_detections(
     if robot.positioning {
         robot.status = RobotStatus::ChaseTennis;
 
-        if filtered_area > position_high {
+        // 当前检测面积具有近距离安全优先级，避免滤波面积滞后时先转向或抓取。
+        if area_ratio > position_high {
             robot.grab_confirm_count = 0;
             eprintln!(
-                "[control] positioning-too-close: filtered={filtered_area:.3} > {position_high:.3}; reverse-straight speed={NEAR_DISTANCE_SPEED} time={}ms",
+                "[control] positioning-too-close: area={area_ratio:.3} filtered={filtered_area:.3} > {position_high:.3}; reverse-straight speed={NEAR_DISTANCE_SPEED} time={}ms",
                 NEAR_MOVE_US / 1000
             );
             motor.drive(-NEAR_DISTANCE_SPEED, -NEAR_DISTANCE_SPEED);
             sleep_us(NEAR_MOVE_US);
+            motor.brake();
+            return;
+        }
+
+        // 后退后原始面积已经回到范围内、但滤波值尚未跟上时，只等待滤波收敛，
+        // 不再依据旧值多后退一次。
+        if filtered_area > position_high {
+            robot.grab_confirm_count = 0;
+            eprintln!(
+                "[control] positioning-distance-settle: area={area_ratio:.3} filtered={filtered_area:.3} high={position_high:.3}; braking"
+            );
             motor.brake();
             return;
         }
@@ -532,16 +654,27 @@ fn handle_detections(
             return;
         }
 
-        if filtered_area < position_low {
+        if area_ratio < position_low && filtered_area < position_low {
             robot.grab_confirm_count = 0;
             eprintln!(
-                "[control] positioning-too-far: filtered={filtered_area:.3} < {position_low:.3}; forward-straight speed={NEAR_DISTANCE_SPEED} time={}ms",
+                "[control] positioning-too-far: area={area_ratio:.3} filtered={filtered_area:.3} < {position_low:.3}; forward-straight speed={NEAR_DISTANCE_SPEED} time={}ms",
                 NEAR_MOVE_US / 1000
             );
             motor.drive(NEAR_DISTANCE_SPEED, NEAR_DISTANCE_SPEED);
             sleep_us(NEAR_MOVE_US);
             motor.brake();
             robot.last_motion_was_forward = true;
+            return;
+        }
+
+        // 前进只在当前值和滤波值共同确认太远时执行；两者不一致先停车观察，
+        // 避免刚后退就立即反向前进。
+        if area_ratio < position_low || filtered_area < position_low {
+            robot.grab_confirm_count = 0;
+            eprintln!(
+                "[control] positioning-distance-settle: area={area_ratio:.3} filtered={filtered_area:.3} low={position_low:.3}; braking"
+            );
+            motor.brake();
             return;
         }
 
@@ -578,8 +711,8 @@ fn handle_detections(
 
         match robot.approach_phase {
             ApproachPhase::Fast => {
-                if predicted_area >= fast_exit {
-                    let next_phase = if predicted_area >= medium_exit {
+                if braking_area >= fast_exit {
+                    let next_phase = if braking_area >= medium_exit {
                         ApproachPhase::Fine
                     } else {
                         ApproachPhase::Medium
@@ -603,7 +736,7 @@ fn handle_detections(
                 );
             }
             ApproachPhase::Medium => {
-                if predicted_area >= medium_exit {
+                if braking_area >= medium_exit {
                     robot.enter_approach_phase(ApproachPhase::Fine);
                     eprintln!(
                         "[control] phase-brake: Medium -> Fine area={area_ratio:.3} predicted={predicted_area:.3}"
@@ -622,7 +755,7 @@ fn handle_detections(
                 );
             }
             ApproachPhase::Fine => {
-                if predicted_area >= distance_low {
+                if braking_area >= distance_low {
                     eprintln!(
                         "[control] predictive-brake: area={area_ratio:.3} predicted={predicted_area:.3} target={stop_area:.3}"
                     );
@@ -655,9 +788,13 @@ fn handle_detections(
     }
 }
 
-fn allow_one_frame_far_miss(robot: &RobotState) -> bool {
+fn allow_one_frame_far_miss(robot: &RobotState, stop_area: f32) -> bool {
+    let distance_low = (stop_area - DISTANCE_MARGIN).max(0.0);
+    let (fast_exit, _) = approach_thresholds(distance_low);
+    let far_miss_limit = (fast_exit - FAST_RECOVERY_MARGIN).max(0.0);
     robot.miss_count == 1
         && !robot.positioning
+        && robot.filtered_area_ratio < far_miss_limit
         && matches!(
             robot.approach_phase,
             ApproachPhase::Fast | ApproachPhase::Medium
@@ -822,9 +959,14 @@ mod tests {
     use super::{
         allow_one_frame_far_miss, approach_center_offset, approach_thresholds,
         forward_steering_speeds, position_turn_us, proportional_turn_delta, scaled_reference_px,
-        target_phase_for_area, target_x, ApproachPhase, RobotState, SteeringState,
-        POSITION_TURN_MAX_US, POSITION_TURN_MIN_US,
+        target_phase_for_area, target_x, ApproachPhase, DistanceRecovery, RobotState,
+        SteeringState, IDLE_SPEED, POSITION_TURN_MAX_US, POSITION_TURN_MIN_US,
     };
+
+    #[test]
+    fn search_rotation_uses_requested_speed() {
+        assert_eq!(IDLE_SPEED, 28);
+    }
 
     #[test]
     fn scales_shifted_target_and_margin() {
@@ -853,30 +995,104 @@ mod tests {
 
     #[test]
     fn approach_thresholds_scale_with_stop_distance() {
-        let (fast, medium) = approach_thresholds(0.48);
-        assert!((fast - 0.336).abs() < 0.0001);
-        assert!((medium - 0.432).abs() < 0.0001);
+        let (fast, medium) = approach_thresholds(0.46);
+        assert!((fast - 0.23).abs() < 0.0001);
+        assert!((medium - 0.299).abs() < 0.0001);
+    }
+
+    #[test]
+    fn positioning_requires_four_stationary_far_frames_and_only_recovers_to_medium() {
+        let mut state = RobotState::default();
+        state.approach_phase = ApproachPhase::Fine;
+        state.positioning = true;
+        state.grab_confirm_count = 1;
+        state.near_lock_frames = 8;
+
+        for count in 1..4 {
+            assert_eq!(
+                state.observe_distance_recovery(0.28, 0.299, 0.3772, true),
+                DistanceRecovery::Confirming(count)
+            );
+            assert!(state.positioning);
+        }
+        assert_eq!(
+            state.observe_distance_recovery(0.28, 0.299, 0.3772, true),
+            DistanceRecovery::Recovered(ApproachPhase::Medium)
+        );
+        assert_eq!(state.approach_phase, ApproachPhase::Medium);
+        assert!(!state.positioning);
+        assert_eq!(state.grab_confirm_count, 0);
+        assert_eq!(state.near_lock_frames, 4);
+    }
+
+    #[test]
+    fn medium_recovers_to_fast_only_after_near_lock_and_three_far_frames() {
+        let mut state = RobotState::default();
+        state.approach_phase = ApproachPhase::Medium;
+        state.near_lock_frames = 2;
+
+        assert_eq!(
+            state.observe_distance_recovery(0.25, 0.299, 0.3772, true),
+            DistanceRecovery::None
+        );
+        assert_eq!(
+            state.observe_distance_recovery(0.25, 0.299, 0.3772, true),
+            DistanceRecovery::None
+        );
+        assert_eq!(
+            state.observe_distance_recovery(0.25, 0.299, 0.3772, true),
+            DistanceRecovery::None
+        );
+        assert_eq!(
+            state.observe_distance_recovery(0.25, 0.299, 0.3772, true),
+            DistanceRecovery::Recovered(ApproachPhase::Fast)
+        );
+        assert_eq!(state.approach_phase, ApproachPhase::Fast);
+    }
+
+    #[test]
+    fn edge_detection_cannot_confirm_far_recovery() {
+        let mut state = RobotState::default();
+        state.approach_phase = ApproachPhase::Fine;
+        state.positioning = true;
+
+        assert_eq!(
+            state.observe_distance_recovery(0.28, 0.299, 0.3772, true),
+            DistanceRecovery::Confirming(1)
+        );
+        assert_eq!(
+            state.observe_distance_recovery(0.28, 0.299, 0.3772, false),
+            DistanceRecovery::None
+        );
+        assert_eq!(state.far_recovery_count, 0);
+        assert_eq!(state.approach_phase, ApproachPhase::Fine);
+        assert!(state.positioning);
     }
 
     #[test]
     fn allows_only_the_first_far_detection_miss() {
         let mut state = RobotState::default();
         state.miss_count = 1;
-        assert!(allow_one_frame_far_miss(&state));
+        state.filtered_area_ratio = 0.20;
+        assert!(allow_one_frame_far_miss(&state, 0.48));
 
         state.miss_count = 2;
-        assert!(!allow_one_frame_far_miss(&state));
+        assert!(!allow_one_frame_far_miss(&state, 0.48));
 
         state.miss_count = 1;
         state.approach_phase = ApproachPhase::Medium;
-        assert!(allow_one_frame_far_miss(&state));
+        assert!(allow_one_frame_far_miss(&state, 0.48));
 
+        state.filtered_area_ratio = 0.35;
+        assert!(!allow_one_frame_far_miss(&state, 0.48));
+
+        state.filtered_area_ratio = 0.20;
         state.approach_phase = ApproachPhase::Fine;
-        assert!(!allow_one_frame_far_miss(&state));
+        assert!(!allow_one_frame_far_miss(&state, 0.48));
 
         state.approach_phase = ApproachPhase::Fast;
         state.positioning = true;
-        assert!(!allow_one_frame_far_miss(&state));
+        assert!(!allow_one_frame_far_miss(&state, 0.48));
     }
 
     #[test]

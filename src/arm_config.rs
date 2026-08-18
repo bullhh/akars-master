@@ -7,10 +7,10 @@ use std::path::Path;
 use std::str::FromStr;
 
 pub const ARM_ANGLE_MAX: f32 = 270.0;
-pub const DEFAULT_STOP_AREA: f32 = 0.50;
+pub const DEFAULT_STOP_AREA: f32 = 0.48;
 pub const STOP_AREA_MIN: f32 = 0.05;
 pub const STOP_AREA_MAX: f32 = 0.90;
-pub const DEFAULT_CENTER_OFFSET_PX: i32 = 75;
+pub const DEFAULT_CENTER_OFFSET_PX: i32 = 68;
 pub const CENTER_OFFSET_PX_MIN: i32 = -240;
 pub const CENTER_OFFSET_PX_MAX: i32 = 240;
 
@@ -141,13 +141,13 @@ impl Default for ArmCalibration {
                 servo2: 140.0,
             },
             approach: ArmPose {
-                servo0: 245.0,
-                servo1: 110.0,
+                servo0: 227.0,
+                servo1: 105.0,
                 servo2: 150.0,
             },
             closed: ArmPose {
-                servo0: 245.0,
-                servo1: 110.0,
+                servo0: 227.0,
+                servo1: 105.0,
                 servo2: 80.0,
             },
             lift: ArmPose {
@@ -309,15 +309,15 @@ mod tests {
     fn uses_board_verified_defaults() {
         let calibration = ArmCalibration::default();
 
-        assert_eq!(calibration.stop_area, 0.50);
-        assert_eq!(calibration.center_offset_px, 75);
+        assert_eq!(calibration.stop_area, 0.48);
+        assert_eq!(calibration.center_offset_px, 68);
         assert_eq!(
             calibration.approach,
-            ArmPose::new(245.0, 110.0, 150.0).unwrap()
+            ArmPose::new(227.0, 105.0, 150.0).unwrap()
         );
         assert_eq!(
             calibration.closed,
-            ArmPose::new(245.0, 110.0, 80.0).unwrap()
+            ArmPose::new(227.0, 105.0, 80.0).unwrap()
         );
     }
 
